@@ -5,7 +5,7 @@ See ``tests.pyx`` for extensive tests.
 """
 
 #*****************************************************************************
-#       Copyright (C) 2011-2016 Jeroen Demeyer <J.Demeyer@UGent.be>
+#       Copyright (C) 2011-2018 Jeroen Demeyer <J.Demeyer@UGent.be>
 #
 #  cysignals is free software: you can redistribute it and/or modify it
 #  under the terms of the GNU Lesser General Public License as published
@@ -26,7 +26,13 @@ from __future__ import absolute_import
 
 from libc.signal cimport *
 from libc.stdio cimport freopen, stdin
-from cpython.exc cimport PyErr_Occurred, PyErr_SetString
+from cpython.ref cimport Py_XINCREF, Py_XDECREF
+from cpython.exc cimport (PyErr_SetString, PyErr_SetNone, PyErr_Occurred,
+        PyErr_Fetch, PyErr_Restore, PyErr_NormalizeException)
+from cpython.version cimport PY_MAJOR_VERSION
+
+import sys
+
 
 cdef extern from "implementation.c":
     cysigs_t cysigs "cysigs"
@@ -37,6 +43,9 @@ cdef extern from "implementation.c":
     void _sig_on_interrupt_received() nogil
     void _sig_on_recover() nogil
     void _sig_off_warning(const char*, int) nogil
+
+    # Python library function
+    void PyErr_Format(object exception, char *format, ...)
 
 
 class AlarmInterrupt(KeyboardInterrupt):
@@ -61,6 +70,7 @@ class AlarmInterrupt(KeyboardInterrupt):
 
     """
     pass
+
 
 class SignalError(BaseException):
     """
@@ -91,11 +101,11 @@ cdef int sig_raise_exception "sig_raise_exception"(int sig, const char* msg) exc
         # Redirect stdin from /dev/null to close interactive sessions
         _ = freopen("/dev/null", "r", stdin)
         # This causes Python to exit
-        raise SystemExit
+        PyErr_SetNone(SystemExit)
     elif sig == SIGINT:
-        raise KeyboardInterrupt
+        PyErr_SetNone(KeyboardInterrupt)
     elif sig == SIGALRM:
-        raise AlarmInterrupt
+        PyErr_SetNone(AlarmInterrupt)
     elif sig == SIGILL:
         if msg is NULL:
             msg = "Illegal instruction"
@@ -117,7 +127,20 @@ cdef int sig_raise_exception "sig_raise_exception"(int sig, const char* msg) exc
             msg = "Segmentation fault"
         PyErr_SetString(SignalError, msg)
     else:
-        raise SystemError(f"unknown signal number {sig}")
+        PyErr_Format(SystemError, "unknown signal number %i", sig)
+
+    # Save exception in cysigs.exc_value
+    cdef PyObject* typ
+    cdef PyObject* val
+    cdef PyObject* tb
+    PyErr_Fetch(&typ, &val, &tb)
+    PyErr_NormalizeException(&typ, &val, &tb)
+    Py_XINCREF(val)
+    Py_XDECREF(cysigs.exc_value)
+    cysigs.exc_value = val
+    PyErr_Restore(typ, val, tb)
+
+    return 0
 
 
 def sig_print_exception(sig, msg=None):
@@ -261,3 +284,45 @@ def python_check_interrupt(sig, frame):
     ``implementation.c``.
     """
     sig_check()
+
+
+cdef void verify_exc_value():
+    """
+    Check that ``cysigs.exc_value`` is still the exception being raised.
+    Clear ``cysigs.exc_value`` if not.
+    """
+    if cysigs.exc_value.ob_refcnt == 1:
+        # No other references => exception is certainly gone
+        Py_XDECREF(cysigs.exc_value)
+        cysigs.exc_value = NULL
+        return
+
+    # We consider the exception in cysigs.exc_value active, even if
+    # there is no actual exception (as returned by PyErr_Occurred).
+    # This is to support the case where the exception is temporarily
+    # disabled by a PyErr_Fetch/PyErr_Restore pair. This happens for
+    # example in Cython's __dealloc__ functions.
+
+    # There is one exception on Python 2: when an exception is
+    # referenced in sys.last_value, we know that it has been handled.
+    # We need to check this because sys.last_value "leaks" a reference
+    # to the exception.
+    if PY_MAJOR_VERSION < 3:
+        try:
+            handled = sys.last_value
+        except AttributeError:
+            pass
+        else:
+            if <PyObject*>handled is cysigs.exc_value:
+                Py_XDECREF(cysigs.exc_value)
+                cysigs.exc_value = NULL
+                return
+
+    # To be safe, we run the garbage collector because it may clear
+    # references to our exception.
+    from gc import collect
+    collect()
+
+    if cysigs.exc_value.ob_refcnt == 1:
+        Py_XDECREF(cysigs.exc_value)
+        cysigs.exc_value = NULL
